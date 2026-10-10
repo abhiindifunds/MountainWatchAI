@@ -1,6 +1,7 @@
 import json
 import math
 import urllib.parse
+from hazard_intel import render_hazard_intel
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -250,6 +251,10 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
             .time-dock input {{ flex: 1; min-width: 50px; accent-color: #ffb900; }}
             .time-dock button {{ border: 1px solid #ffffff55; color: white; background: #08769a; border-radius: 3px; padding: 6px 12px; cursor: pointer; }}
             .time-label {{ min-width: 74px; font-variant-numeric: tabular-nums; }}
+            .layer-status {{ box-sizing: border-box; min-width: 190px; max-width: min(300px, calc(100vw - 180px)); background: #fff; color: #18313b; padding: 9px 12px; border-radius: 4px; box-shadow: 0 2px 9px #001d2d55; }}
+            .layer-status-label {{ display: block; color: #58727b; font-size: 9px; font-weight: 700; margin-bottom: 3px; }}
+            .layer-status strong {{ display: block; font-size: 13px; }}
+            .layer-status small {{ display: block; margin-top: 3px; color: #58727b; line-height: 1.35; }}
             .hazard-alert {{ animation: alert-pulse 1.4s ease-in-out infinite; }}
             @keyframes alert-pulse {{ 50% {{ stroke-opacity: 0.45; stroke-width: 5; }} }}
             .map-legend {{ background: #fff; padding: 9px 12px; line-height: 1.55; color: #263238; border-radius: 4px; box-shadow: 0 1px 6px #0003; max-width: 200px; }}
@@ -270,6 +275,13 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
             map.getPane('labelsPane').style.zIndex = 425;
             map.getPane('labelsPane').style.pointerEvents = 'none';
             const labels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{{z}}/{{y}}/{{x}}', {{ pane: 'labelsPane', maxZoom: 19, attribution: 'Labels &copy; Esri' }}).addTo(map);
+            map.createPane('satelliteCloudPane');
+            map.getPane('satelliteCloudPane').style.zIndex = 420;
+            map.getPane('satelliteCloudPane').style.pointerEvents = 'none';
+            const satelliteCloudLayer = L.tileLayer('https://gibs.earthdata.nasa.gov/wmts/epsg3857/best/Himawari_AHI_Band13_Clean_Infrared/default/GoogleMapsCompatible_Level6/{{z}}/{{y}}/{{x}}.png', {{
+                pane: 'satelliteCloudPane', maxNativeZoom: 6, maxZoom: 12, opacity: 0.78,
+                attribution: 'Himawari imagery &copy; NASA GIBS'
+            }}).addTo(map);
             L.control.zoom({{ position: 'topleft' }}).addTo(map);
             L.control.layers({{ 'Satellite': satellite, 'Street map': street, 'Topographic': topo }}, null, {{ position: 'topright' }}).addTo(map);
             map.createPane('forecastPane');
@@ -289,12 +301,12 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
             }});
             L.circleMarker([{lat}, {lon}], {{ radius: 7, color: '#084298', weight: 2, fillColor: '#0d6efd', fillOpacity: 1 }})
                 .bindPopup('<strong>Monitoring location</strong>').addTo(map);
-            let activeHazard = 'clouds';
+            let activeHazard = 'satellite';
             let forecastHour = 0;
             let radarIndex = Math.max(0, radarFrames.length - 1);
             let activeCount = 0;
             let timer = null;
-            const hazardNames = {{ radar: 'Rain radar', clouds: 'Cloud cover outlook', rain: 'Rain / flood potential', wind: 'Wind gusts', heat: 'Heat stress', cold: 'Cold / snow', storm: 'Thunderstorm risk', quakes: 'Earthquakes (observed)' }};
+            const hazardNames = {{ satellite: 'Satellite clouds', radar: 'Rain radar', clouds: 'Cloud cover forecast', rain: 'Rain / flood potential', wind: 'Wind gusts', heat: 'Heat stress', cold: 'Cold / snow', storm: 'Thunderstorm risk', quakes: 'Earthquakes (observed)' }};
             const colors = {{ green: '#35a66f', yellow: '#f5ce32', orange: '#f28c28', red: '#d9363e', blue: '#3485d3', pale: '#e5edf4', quiet: '#398f9b' }};
             const forecastTimes = forecast.times || [];
             function reading(values, hour) {{ return Number(values?.[hour] ?? 0); }}
@@ -334,29 +346,51 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
                 }}
                 return [...stops[stops.length - 1][1], 230];
             }}
+            function isWeatherSignal(value) {{
+                if (activeHazard === 'rain') return value >= 1;
+                if (activeHazard === 'wind') return value >= 40;
+                if (activeHazard === 'heat') return value >= 32;
+                if (activeHazard === 'cold') return value >= 0.5;
+                if (activeHazard === 'storm') return value >= 50;
+                return true;
+            }}
             forecastLayer.createTile = function(coords, done) {{
                 const tile = document.createElement('canvas');
                 tile.width = tile.height = 256;
                 const context = tile.getContext('2d');
                 if (forecast.available && forecast.points?.length && ['clouds', 'rain', 'wind', 'heat', 'cold', 'storm'].includes(activeHazard)) {{
                     const values = forecast.points.map(point => ({{ lat: point.latitude, lon: point.longitude, value: forecastValue(point, forecastHour) }}));
+                    const gridBounds = values.reduce((bounds, sample) => ({{
+                        minLat: Math.min(bounds.minLat, sample.lat),
+                        maxLat: Math.max(bounds.maxLat, sample.lat),
+                        minLon: Math.min(bounds.minLon, sample.lon),
+                        maxLon: Math.max(bounds.maxLon, sample.lon)
+                    }}), {{ minLat: 90, maxLat: -90, minLon: 180, maxLon: -180 }});
                     const step = 6;
                     for (let y = 0; y < 256; y += step) {{
                         for (let x = 0; x < 256; x += step) {{
                             const location = map.unproject([coords.x * 256 + x + step / 2, coords.y * 256 + y + step / 2], coords.z);
+                            if (location.lat < gridBounds.minLat || location.lat > gridBounds.maxLat || location.lng < gridBounds.minLon || location.lng > gridBounds.maxLon) continue;
                             let weightedValue = 0;
                             let totalWeight = 0;
+                            let nearestDistance = Infinity;
                             values.forEach(sample => {{
                                 const northKm = (location.lat - sample.lat) * 111;
                                 const eastKm = (location.lng - sample.lon) * 111 * Math.cos(location.lat * Math.PI / 180);
                                 const distanceSquared = northKm * northKm + eastKm * eastKm;
+                                nearestDistance = Math.min(nearestDistance, Math.sqrt(distanceSquared));
                                 const weight = 1 / (distanceSquared + 2500);
                                 weightedValue += sample.value * weight;
                                 totalWeight += weight;
                             }});
-                            const color = hazardColor(weightedValue / totalWeight);
+                            const interpolated = weightedValue / totalWeight;
+                            if (nearestDistance > {radius_km} * 0.45 || !isWeatherSignal(interpolated)) continue;
+                            const color = hazardColor(interpolated);
+                            const edgeFade = Math.max(0, Math.min(1, (1 - nearestDistance / ({radius_km} * 0.45)) * 1.8));
                             context.fillStyle = `rgba(${{color[0]}},${{color[1]}},${{color[2]}},${{color[3] / 255}})`;
+                            context.globalAlpha = edgeFade;
                             context.fillRect(x, y, step, step);
+                            context.globalAlpha = 1;
                         }}
                     }}
                 }}
@@ -385,7 +419,7 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
             }}
             function drawForecast() {{
                 activeCount = 0;
-                if (!forecast.available || !forecast.points?.length || activeHazard === 'radar' || activeHazard === 'quakes') return;
+                if (!forecast.available || !forecast.points?.length || ['satellite', 'radar', 'quakes'].includes(activeHazard)) return;
                 forecast.points.forEach(point => {{ if (assess(point, forecastHour).active) activeCount += 1; }});
                 forecastLayer.redraw();
             }}
@@ -399,21 +433,38 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
                 const slider = document.getElementById('time-slider');
                 const label = document.getElementById('time-label');
                 const radarMode = activeHazard === 'radar';
+                const satelliteMode = activeHazard === 'satellite';
                 const max = radarMode ? Math.max(0, radarFrames.length - 1) : Math.max(0, forecastTimes.length - 1);
                 slider.max = max;
+                slider.disabled = satelliteMode;
                 slider.value = radarMode ? radarIndex : forecastHour;
                 if (radarMode) {{
                     const timestamp = radarFrames[radarIndex]?.time;
                     label.textContent = timestamp ? new Date(timestamp * 1000).toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit' }}) : 'Radar unavailable';
                     showRadar();
+                }} else if (satelliteMode) {{
+                    label.textContent = 'Latest satellite image';
                 }} else {{
                     const timestamp = forecastTimes[forecastHour];
                     label.textContent = timestamp ? new Date(timestamp + 'Z').toLocaleString([], {{ weekday: 'short', hour: '2-digit', minute: '2-digit' }}) : 'Forecast unavailable';
                     drawForecast();
                 }}
                 const signalCount = activeHazard === 'quakes' ? earthquakeData.length : activeCount;
-                document.getElementById('map-title').textContent = ['radar', 'clouds'].includes(activeHazard) ? hazardNames[activeHazard] : `${{hazardNames[activeHazard]}} · ${{signalCount}} signals`;
-                document.getElementById('time-range').textContent = radarMode ? 'Past radar / nowcast' : 'Forecast hour';
+                document.getElementById('map-title').textContent = ['radar', 'clouds', 'satellite'].includes(activeHazard) ? hazardNames[activeHazard] : `${{hazardNames[activeHazard]}} · ${{signalCount}} signals`;
+                document.getElementById('time-range').textContent = radarMode ? 'Radar observations / nowcast' : satelliteMode ? 'Himawari infrared · NASA GIBS' : 'Forecast hour';
+                document.getElementById('layer-status-name').textContent = hazardNames[activeHazard];
+                let layerDetail;
+                if (satelliteMode) layerDetail = 'Observed Himawari infrared image - latest available';
+                else if (radarMode) layerDetail = radarFrames.length ? `RainViewer observed radar - ${{label.textContent}}` : 'Radar frames unavailable';
+                else if (activeHazard === 'quakes') layerDetail = earthquakeData.length ? `${{earthquakeData.length}} USGS events in the last 24 hours` : 'No USGS events in the selected radius in the last 24 hours';
+                else if (activeHazard === 'clouds') layerDetail = `Open-Meteo cloud forecast - ${{label.textContent}} UTC`;
+                else layerDetail = activeCount ? `${{activeCount}} grid points cross the threshold - ${{label.textContent}} UTC` : `No threshold signals at ${{label.textContent}} UTC`;
+                document.getElementById('layer-detail').textContent = layerDetail;
+                const legend = document.querySelector('.map-legend');
+                legend.style.display = ['clouds', 'satellite'].includes(activeHazard) ? 'block' : 'none';
+                legend.innerHTML = satelliteMode
+                    ? '<strong>Satellite infrared</strong><br><small>Himawari · latest available</small>'
+                    : '<strong>Cloud cover forecast</strong><div class="cloud-gradient"></div><div class="cloud-range"><span>Clear</span><span>Overcast</span></div><small>Open-Meteo model outlook</small>';
             }}
             map.on('click', event => {{
                 if (!['clouds', 'rain', 'wind', 'heat', 'cold', 'storm'].includes(activeHazard) || !forecast.points?.length) return;
@@ -428,18 +479,24 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
             }});
             function selectHazard(name) {{
                 activeHazard = name;
-                document.querySelector('.map-legend').style.display = name === 'clouds' ? 'block' : 'none';
                 document.querySelectorAll('.hazard-menu button').forEach(button => button.classList.toggle('active', button.dataset.mode === name));
                 if (name === 'quakes') {{
                     if (map.hasLayer(radarLayer)) map.removeLayer(radarLayer);
+                    if (map.hasLayer(satelliteCloudLayer)) map.removeLayer(satelliteCloudLayer);
                     if (map.hasLayer(forecastLayer)) map.removeLayer(forecastLayer);
                     if (!map.hasLayer(earthquakeLayer)) earthquakeLayer.addTo(map);
                 }} else {{
                     if (map.hasLayer(earthquakeLayer)) map.removeLayer(earthquakeLayer);
                     if (name === 'radar') {{
+                        if (map.hasLayer(satelliteCloudLayer)) map.removeLayer(satelliteCloudLayer);
                         if (map.hasLayer(forecastLayer)) map.removeLayer(forecastLayer);
                         if (!map.hasLayer(radarLayer)) radarLayer.addTo(map);
+                    }} else if (name === 'satellite') {{
+                        if (map.hasLayer(radarLayer)) map.removeLayer(radarLayer);
+                        if (map.hasLayer(forecastLayer)) map.removeLayer(forecastLayer);
+                        if (!map.hasLayer(satelliteCloudLayer)) satelliteCloudLayer.addTo(map);
                     }} else {{
+                        if (map.hasLayer(satelliteCloudLayer)) map.removeLayer(satelliteCloudLayer);
                         if (map.hasLayer(radarLayer)) map.removeLayer(radarLayer);
                         if (!map.hasLayer(forecastLayer)) forecastLayer.addTo(map);
                     }}
@@ -449,7 +506,7 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
             const menu = L.control({{ position: 'topleft' }});
             menu.onAdd = () => {{
                 const div = L.DomUtil.create('div', 'hazard-menu');
-                [['clouds','Cloud cover'],['radar','Rain radar'],['rain','Rain / flood'],['wind','Wind gusts'],['heat','Heat stress'],['cold','Cold / snow'],['storm','Thunderstorm'],['quakes','Earthquakes']].forEach(([mode,label]) => {{
+                [['satellite','Satellite clouds'],['radar','Rain radar'],['clouds','Cloud forecast'],['rain','Rain / flood'],['wind','Wind gusts'],['heat','Heat stress'],['cold','Cold / snow'],['storm','Thunderstorm'],['quakes','Earthquakes']].forEach(([mode,label]) => {{
                     const button = L.DomUtil.create('button', '', div);
                     button.type = 'button'; button.dataset.mode = mode; button.textContent = label;
                     button.classList.toggle('active', mode === activeHazard);
@@ -467,6 +524,14 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
                 return div;
             }};
             dock.addTo(map);
+            const statusControl = L.control({{ position: 'topright' }});
+            statusControl.onAdd = () => {{
+                const div = L.DomUtil.create('div', 'layer-status');
+                div.innerHTML = '<span class="layer-status-label">ACTIVE MAP LAYER</span><strong id="layer-status-name">Satellite clouds</strong><small id="layer-detail">Observed Himawari infrared image - latest available</small>';
+                L.DomEvent.disableClickPropagation(div);
+                return div;
+            }};
+            statusControl.addTo(map);
             setTimeout(() => {{
                 const slider = document.getElementById('time-slider');
                 slider.oninput = () => {{ if (activeHazard === 'radar') radarIndex = Number(slider.value); else forecastHour = Number(slider.value); updateTime(); }};
@@ -490,7 +555,8 @@ def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_fr
                 return div;
             }};
             cloudLegend.addTo(map);
-            document.querySelector('.map-legend').style.display = activeHazard === 'clouds' ? 'block' : 'none';
+            document.querySelector('.map-legend').style.display = 'block';
+            document.querySelector('.map-legend').innerHTML = '<strong>Satellite infrared</strong><br><small>Himawari · latest available</small>';
         </script>
     </body></html>
     """
@@ -692,9 +758,9 @@ def main():
         st.info("Live radar frames are currently unavailable from the radar provider; forecast overlays remain available.")
     render_hazard_map(lat, lon, radius_km, eq_df, hazard_outlook, radar_frames)
     st.caption(
-        "Cloud cover and colored hazard fields are interpolated forecasts; Rain radar is observed/nowcast data. "
-        "The cloud layer is not a satellite image. "
-        "These layers are not official warnings and may miss local mountain conditions."
+        "Satellite clouds are Himawari infrared observations from NASA GIBS; Rain radar is RainViewer radar/nowcast. "
+        "Other colored hazard layers are localized Open-Meteo forecasts, not observations. They are not official warnings "
+        "and can miss local mountain conditions."
     )
 
     if enable_whatsapp and whatsapp_number:
@@ -765,7 +831,7 @@ def main():
             st.caption("No live disaster feed data available right now.")
 
     with tab2:
-        st.info("The interactive weather map is displayed above.")
+       render_hazard_intel(lat, lon)
 
     with tab3:
         factor_df = pd.DataFrame({"Factor": list(contrib), "Points": list(contrib.values())}).set_index("Factor")
