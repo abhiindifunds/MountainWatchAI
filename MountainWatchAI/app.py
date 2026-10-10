@@ -1,4 +1,5 @@
 import json
+import math
 import urllib.parse
 from datetime import datetime, timezone
 from pathlib import Path
@@ -153,6 +154,349 @@ def fetch_recent_earthquakes(lat, lon, radius_km=250):
     return eq_df.sort_values("mag", ascending=False)
 
 
+def classify_rainfall_signal(peak_hour_mm):
+    if peak_hour_mm >= 50:
+        return "Extreme hourly rain signal"
+    if peak_hour_mm >= 20:
+        return "Heavy rain signal"
+    return "No heavy rain signal"
+
+
+@st.cache_data(ttl=600)
+def fetch_hazard_outlook(lat, lon, radius_km=250):
+    radius = radius_km * 0.75
+    latitude_step = radius * 2 / 8 / 111.0
+    longitude_step = radius * 2 / 8 / max(111.0 * abs(math.cos(math.radians(lat))), 1.0)
+    points = [
+        (max(-90.0, min(90.0, lat + row * latitude_step)),
+         ((lon + column * longitude_step + 180) % 360) - 180)
+        for row in range(-4, 5)
+        for column in range(-4, 5)
+    ]
+    url = (
+        "https://api.open-meteo.com/v1/forecast?"
+        f"latitude={','.join(f'{point[0]:.4f}' for point in points)}&"
+        f"longitude={','.join(f'{point[1]:.4f}' for point in points)}&"
+        "hourly=precipitation,wind_gusts_10m,temperature_2m,snowfall,weather_code,cape,cloud_cover&"
+        "forecast_days=3&timezone=UTC"
+    )
+    try:
+        request = Request(url, headers={"User-Agent": "MountainWatchAI/1.0"})
+        with urlopen(request, timeout=15) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        return {"times": [], "points": [], "available": False}
+
+    locations = payload if isinstance(payload, list) else [payload]
+    rows = []
+    for (point_lat, point_lon), location in zip(points, locations):
+        hourly = location.get("hourly", {})
+        rows.append({
+            "latitude": point_lat,
+            "longitude": point_lon,
+            "precipitation": hourly.get("precipitation", []),
+            "wind": hourly.get("wind_gusts_10m", []),
+            "temperature": hourly.get("temperature_2m", []),
+            "snowfall": hourly.get("snowfall", []),
+            "weather_code": hourly.get("weather_code", []),
+            "cape": hourly.get("cape", []),
+            "cloud_cover": hourly.get("cloud_cover", []),
+        })
+    times = locations[0].get("hourly", {}).get("time", []) if locations else []
+    available = bool(times and rows and rows[0]["precipitation"] and rows[0]["temperature"])
+    return {"times": times, "points": rows, "available": available}
+
+
+@st.cache_data(ttl=300)
+def fetch_radar_frames():
+    try:
+        request = Request(
+            "https://api.rainviewer.com/public/weather-maps.json",
+            headers={"User-Agent": "MountainWatchAI/1.0"},
+        )
+        with urlopen(request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except (HTTPError, URLError, TimeoutError, ValueError):
+        return []
+
+    frames = payload.get("radar", {}).get("past", []) + payload.get("radar", {}).get("nowcast", [])
+    return [{"path": frame.get("path"), "time": frame.get("time")} for frame in frames if frame.get("path")]
+
+
+def render_hazard_map(lat, lon, radius_km, earthquakes, hazard_outlook, radar_frames):
+    earthquake_points = [{
+        "latitude": float(event["latitude"]),
+        "longitude": float(event["longitude"]),
+        "magnitude": float(event["mag"] or 0),
+        "place": str(event["place"]),
+        "time": str(event["time"]),
+    } for event in earthquakes.to_dict("records")]
+    event_json = json.dumps(earthquake_points).replace("</", "<\\/")
+    forecast_json = json.dumps(hazard_outlook).replace("</", "<\\/")
+    radar_json = json.dumps(radar_frames).replace("</", "<\\/")
+    map_html = f"""
+    <!doctype html>
+    <html><head>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+        <style>
+            html, body, #map {{ height: 100%; width: 100%; margin: 0; font: 13px Arial, sans-serif; }}
+            .leaflet-control-layers, .leaflet-bar {{ border: 0 !important; box-shadow: 0 2px 9px #001d2d55 !important; }}
+            .hazard-menu {{ background: #075879; padding: 5px; border-radius: 4px; box-shadow: 0 2px 9px #001d2d66; }}
+            .hazard-menu button {{ display: block; border: 0; width: 132px; padding: 9px 10px; margin: 2px 0; text-align: left; color: #effaff; background: transparent; cursor: pointer; border-radius: 3px; font-size: 12px; }}
+            .hazard-menu button.active, .hazard-menu button:hover {{ background: #f2ab00; color: #162a33; }}
+            .time-dock {{ box-sizing: border-box; width: min(510px, calc(100vw - 95px)); background: #075879ee; color: white; padding: 10px 12px; border-radius: 4px; box-shadow: 0 2px 9px #001d2d66; }}
+            .time-dock .time-row {{ display: flex; align-items: center; gap: 10px; }}
+            .time-dock input {{ flex: 1; min-width: 50px; accent-color: #ffb900; }}
+            .time-dock button {{ border: 1px solid #ffffff55; color: white; background: #08769a; border-radius: 3px; padding: 6px 12px; cursor: pointer; }}
+            .time-label {{ min-width: 74px; font-variant-numeric: tabular-nums; }}
+            .hazard-alert {{ animation: alert-pulse 1.4s ease-in-out infinite; }}
+            @keyframes alert-pulse {{ 50% {{ stroke-opacity: 0.45; stroke-width: 5; }} }}
+            .map-legend {{ background: #fff; padding: 9px 12px; line-height: 1.55; color: #263238; border-radius: 4px; box-shadow: 0 1px 6px #0003; max-width: 200px; }}
+            .legend-dot {{ display: inline-block; width: 10px; height: 10px; border-radius: 50%; margin-right: 6px; }}
+            .cloud-gradient {{ height: 12px; margin: 6px 0 2px; border: 1px solid #b6c2c9; background: linear-gradient(90deg, rgba(239,246,250,0.05), rgba(239,246,250,0.48), rgba(255,255,255,0.94)); }}
+            .cloud-range {{ display: flex; justify-content: space-between; font-size: 11px; }}
+            .leaflet-popup-content {{ line-height: 1.5; }}
+        </style>
+    </head><body>
+        <div id="map"></div>
+        <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+        <script>
+            const map = L.map('map', {{ zoomControl: false }}).setView([{lat}, {lon}], 7);
+            const satellite = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{{z}}/{{y}}/{{x}}', {{ maxZoom: 19, attribution: 'Tiles &copy; Esri' }}).addTo(map);
+            const street = L.tileLayer('https://{{s}}.tile.openstreetmap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 19, attribution: '&copy; OpenStreetMap contributors' }});
+            const topo = L.tileLayer('https://{{s}}.tile.opentopomap.org/{{z}}/{{x}}/{{y}}.png', {{ maxZoom: 17, attribution: '&copy; OpenTopoMap contributors' }});
+            map.createPane('labelsPane');
+            map.getPane('labelsPane').style.zIndex = 425;
+            map.getPane('labelsPane').style.pointerEvents = 'none';
+            const labels = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/Reference/World_Boundaries_and_Places/MapServer/tile/{{z}}/{{y}}/{{x}}', {{ pane: 'labelsPane', maxZoom: 19, attribution: 'Labels &copy; Esri' }}).addTo(map);
+            L.control.zoom({{ position: 'topleft' }}).addTo(map);
+            L.control.layers({{ 'Satellite': satellite, 'Street map': street, 'Topographic': topo }}, null, {{ position: 'topright' }}).addTo(map);
+            map.createPane('forecastPane');
+            map.getPane('forecastPane').style.zIndex = 450;
+            map.getPane('forecastPane').style.pointerEvents = 'none';
+            const earthquakeData = {event_json};
+            const forecast = {forecast_json};
+            const radarFrames = {radar_json};
+            const safe = value => String(value ?? '').replace(/[&<>"']/g, char => ({{ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }}[char]));
+            const radarLayer = L.tileLayer('', {{ opacity: 0.78, maxZoom: 12, tileSize: 256, attribution: 'Radar &copy; RainViewer' }});
+            const forecastLayer = L.gridLayer({{ tileSize: 256, opacity: 0.93, maxZoom: 12, pane: 'forecastPane' }}).addTo(map);
+            const earthquakeLayer = L.layerGroup();
+            earthquakeData.forEach(event => {{
+                const radius = Math.max(6, Math.min(18, 5 + event.magnitude * 2));
+                L.circleMarker([event.latitude, event.longitude], {{ radius, color: '#842029', weight: 2, fillColor: '#dc3545', fillOpacity: 0.8, className: event.magnitude >= 4.5 ? 'hazard-alert' : '' }})
+                    .bindPopup(`<strong>M${{event.magnitude.toFixed(1)}} earthquake</strong><br>${{safe(event.place)}}<br>${{safe(event.time)}} UTC`).addTo(earthquakeLayer);
+            }});
+            L.circleMarker([{lat}, {lon}], {{ radius: 7, color: '#084298', weight: 2, fillColor: '#0d6efd', fillOpacity: 1 }})
+                .bindPopup('<strong>Monitoring location</strong>').addTo(map);
+            let activeHazard = 'clouds';
+            let forecastHour = 0;
+            let radarIndex = Math.max(0, radarFrames.length - 1);
+            let activeCount = 0;
+            let timer = null;
+            const hazardNames = {{ radar: 'Rain radar', clouds: 'Cloud cover outlook', rain: 'Rain / flood potential', wind: 'Wind gusts', heat: 'Heat stress', cold: 'Cold / snow', storm: 'Thunderstorm risk', quakes: 'Earthquakes (observed)' }};
+            const colors = {{ green: '#35a66f', yellow: '#f5ce32', orange: '#f28c28', red: '#d9363e', blue: '#3485d3', pale: '#e5edf4', quiet: '#398f9b' }};
+            const forecastTimes = forecast.times || [];
+            function reading(values, hour) {{ return Number(values?.[hour] ?? 0); }}
+            function forecastValue(point, hour) {{
+                const rain = reading(point.precipitation, hour);
+                const rain3h = rain + reading(point.precipitation, hour + 1) + reading(point.precipitation, hour + 2);
+                const wind = reading(point.wind, hour);
+                const temp = reading(point.temperature, hour);
+                const snow = reading(point.snowfall, hour);
+                const cape = reading(point.cape, hour);
+                const code = reading(point.weather_code, hour);
+                if (activeHazard === 'clouds') return reading(point.cloud_cover, hour);
+                if (activeHazard === 'rain') return rain3h;
+                if (activeHazard === 'wind') return wind;
+                if (activeHazard === 'heat') return temp;
+                if (activeHazard === 'cold') return Math.max(snow, temp <= 0 ? 1 + Math.min(Math.abs(temp), 5) * 0.2 : 0);
+                return Math.max(cape / 20, code >= 95 ? 60 + (code - 95) * 20 : 0);
+            }}
+            function hazardColor(value) {{
+                let stops;
+                if (activeHazard === 'clouds') return [239, 246, 250, Math.round(Math.max(0, Math.min(0.92, Math.pow(Math.max(0, (value - 4) / 96), 0.58) * 0.92)) * 255)];
+                if (activeHazard === 'rain') stops = [[0.2, [68, 164, 219]], [1, [52, 195, 190]], [5, [69, 181, 93]], [20, [246, 219, 63]], [50, [245, 137, 47]], [100, [218, 49, 58]]];
+                else if (activeHazard === 'wind') stops = [[0, [48, 151, 211]], [10, [51, 190, 190]], [20, [76, 183, 107]], [35, [241, 211, 53]], [60, [244, 133, 46]], [90, [207, 48, 67]]];
+                else if (activeHazard === 'heat') stops = [[-10, [47, 113, 203]], [5, [47, 177, 211]], [15, [56, 185, 147]], [22, [110, 190, 79]], [28, [242, 210, 58]], [35, [241, 130, 42]], [42, [205, 43, 56]]];
+                else if (activeHazard === 'cold') stops = [[0, [54, 158, 173]], [0.5, [75, 192, 224]], [1, [59, 132, 218]], [5, [109, 72, 191]]];
+                else stops = [[0, [47, 153, 205]], [500, [40, 190, 170]], [1000, [237, 216, 57]], [2000, [242, 135, 45]], [3000, [207, 43, 61]]];
+                if (activeHazard === 'rain' && value < 0.2) return [56, 143, 155, 0];
+                if (value <= stops[0][0]) return [56, 143, 155, 145];
+                for (let index = 1; index < stops.length; index += 1) {{
+                    if (value <= stops[index][0]) {{
+                        const [lowValue, lowColor] = stops[index - 1];
+                        const [highValue, highColor] = stops[index];
+                        const ratio = (value - lowValue) / Math.max(highValue - lowValue, 0.001);
+                        const rgb = lowColor.map((channel, channelIndex) => Math.round(channel + (highColor[channelIndex] - channel) * ratio));
+                        return [...rgb, 205];
+                    }}
+                }}
+                return [...stops[stops.length - 1][1], 230];
+            }}
+            forecastLayer.createTile = function(coords, done) {{
+                const tile = document.createElement('canvas');
+                tile.width = tile.height = 256;
+                const context = tile.getContext('2d');
+                if (forecast.available && forecast.points?.length && ['clouds', 'rain', 'wind', 'heat', 'cold', 'storm'].includes(activeHazard)) {{
+                    const values = forecast.points.map(point => ({{ lat: point.latitude, lon: point.longitude, value: forecastValue(point, forecastHour) }}));
+                    const step = 6;
+                    for (let y = 0; y < 256; y += step) {{
+                        for (let x = 0; x < 256; x += step) {{
+                            const location = map.unproject([coords.x * 256 + x + step / 2, coords.y * 256 + y + step / 2], coords.z);
+                            let weightedValue = 0;
+                            let totalWeight = 0;
+                            values.forEach(sample => {{
+                                const northKm = (location.lat - sample.lat) * 111;
+                                const eastKm = (location.lng - sample.lon) * 111 * Math.cos(location.lat * Math.PI / 180);
+                                const distanceSquared = northKm * northKm + eastKm * eastKm;
+                                const weight = 1 / (distanceSquared + 2500);
+                                weightedValue += sample.value * weight;
+                                totalWeight += weight;
+                            }});
+                            const color = hazardColor(weightedValue / totalWeight);
+                            context.fillStyle = `rgba(${{color[0]}},${{color[1]}},${{color[2]}},${{color[3] / 255}})`;
+                            context.fillRect(x, y, step, step);
+                        }}
+                    }}
+                }}
+                tile.classList.add('leaflet-tile-loaded');
+                done(null, tile);
+                return tile;
+            }};
+            function assess(point, hour) {{
+                const rain = reading(point.precipitation, hour);
+                const rain3h = rain + reading(point.precipitation, hour + 1) + reading(point.precipitation, hour + 2);
+                const wind = reading(point.wind, hour);
+                const temp = reading(point.temperature, hour);
+                const snow = reading(point.snowfall, hour);
+                const cape = reading(point.cape, hour);
+                const code = reading(point.weather_code, hour);
+                if (activeHazard === 'clouds') {{
+                    const cloudCover = reading(point.cloud_cover, hour);
+                    return {{ active: false, value: `${{cloudCover.toFixed(0)}}% cloud cover`, detail: 'Open-Meteo model outlook', color: '#dfe9ef', level: 'Forecast cloud cover' }};
+                }}
+                if (activeHazard === 'rain') return {{ active: rain >= 5 || rain3h >= 20, value: `${{rain.toFixed(1)}} mm/h`, detail: `${{rain3h.toFixed(1)}} mm / 3h`, color: rain >= 50 || rain3h >= 100 ? colors.red : rain >= 20 || rain3h >= 50 ? colors.orange : rain >= 5 || rain3h >= 20 ? colors.yellow : colors.quiet, level: rain >= 50 || rain3h >= 100 ? 'Extreme rain / flood potential proxy' : rain >= 20 || rain3h >= 50 ? 'Heavy rain signal' : rain >= 5 || rain3h >= 20 ? 'Rainfall signal' : 'No heavy-rain threshold crossed' }};
+                if (activeHazard === 'wind') return {{ active: wind >= 40, value: `${{wind.toFixed(0)}} km/h gust`, detail: 'Forecast peak gust', color: wind >= 90 ? colors.red : wind >= 60 ? colors.orange : wind >= 40 ? colors.yellow : colors.quiet, level: wind >= 90 ? 'Severe gust signal' : wind >= 60 ? 'Strong gust signal' : wind >= 40 ? 'Elevated gust signal' : 'No strong-gust threshold crossed' }};
+                if (activeHazard === 'heat') return {{ active: temp >= 32, value: `${{temp.toFixed(1)}} °C`, detail: 'Forecast air temperature', color: temp >= 40 ? colors.red : temp >= 35 ? colors.orange : temp >= 32 ? colors.yellow : colors.quiet, level: temp >= 40 ? 'Extreme heat signal' : temp >= 35 ? 'High heat signal' : temp >= 32 ? 'Elevated heat signal' : 'No heat threshold crossed' }};
+                if (activeHazard === 'cold') return {{ active: snow >= 1 || temp <= 0, value: `${{temp.toFixed(1)}} °C`, detail: `${{snow.toFixed(1)}} mm/h snowfall`, color: snow >= 5 ? colors.red : snow >= 1 || temp <= 0 ? colors.blue : colors.quiet, level: snow >= 5 ? 'Heavy snow signal' : snow >= 1 || temp <= 0 ? 'Freezing / snow signal' : 'No freezing or snow threshold crossed' }};
+                const thunder = code >= 95 || (cape >= 1000 && rain >= 1);
+                return {{ active: thunder, value: `${{cape.toFixed(0)}} J/kg CAPE`, detail: `Rain ${{rain.toFixed(1)}} mm/h; WMO code ${{code}}`, color: code >= 96 || (cape >= 2000 && rain >= 10) ? colors.red : thunder ? colors.orange : colors.quiet, level: thunder ? 'Thunderstorm conditions indicated' : 'No thunderstorm threshold crossed' }};
+            }}
+            function drawForecast() {{
+                activeCount = 0;
+                if (!forecast.available || !forecast.points?.length || activeHazard === 'radar' || activeHazard === 'quakes') return;
+                forecast.points.forEach(point => {{ if (assess(point, forecastHour).active) activeCount += 1; }});
+                forecastLayer.redraw();
+            }}
+            function showRadar() {{
+                if (!radarFrames.length) return;
+                const frame = radarFrames[radarIndex];
+                radarLayer.setUrl(`https://tilecache.rainviewer.com${{frame.path}}/256/{{z}}/{{x}}/{{y}}/2/1_1.png`);
+                if (!map.hasLayer(radarLayer)) radarLayer.addTo(map);
+            }}
+            function updateTime() {{
+                const slider = document.getElementById('time-slider');
+                const label = document.getElementById('time-label');
+                const radarMode = activeHazard === 'radar';
+                const max = radarMode ? Math.max(0, radarFrames.length - 1) : Math.max(0, forecastTimes.length - 1);
+                slider.max = max;
+                slider.value = radarMode ? radarIndex : forecastHour;
+                if (radarMode) {{
+                    const timestamp = radarFrames[radarIndex]?.time;
+                    label.textContent = timestamp ? new Date(timestamp * 1000).toLocaleTimeString([], {{ hour: '2-digit', minute: '2-digit' }}) : 'Radar unavailable';
+                    showRadar();
+                }} else {{
+                    const timestamp = forecastTimes[forecastHour];
+                    label.textContent = timestamp ? new Date(timestamp + 'Z').toLocaleString([], {{ weekday: 'short', hour: '2-digit', minute: '2-digit' }}) : 'Forecast unavailable';
+                    drawForecast();
+                }}
+                const signalCount = activeHazard === 'quakes' ? earthquakeData.length : activeCount;
+                document.getElementById('map-title').textContent = ['radar', 'clouds'].includes(activeHazard) ? hazardNames[activeHazard] : `${{hazardNames[activeHazard]}} · ${{signalCount}} signals`;
+                document.getElementById('time-range').textContent = radarMode ? 'Past radar / nowcast' : 'Forecast hour';
+            }}
+            map.on('click', event => {{
+                if (!['clouds', 'rain', 'wind', 'heat', 'cold', 'storm'].includes(activeHazard) || !forecast.points?.length) return;
+                const nearest = forecast.points.reduce((best, point) => {{
+                    const distance = Math.hypot(event.latlng.lat - point.latitude, (event.latlng.lng - point.longitude) * Math.cos(event.latlng.lat * Math.PI / 180));
+                    return !best || distance < best.distance ? {{ point, distance }} : best;
+                }}, null);
+                if (!nearest) return;
+                const point = nearest.point;
+                const result = assess(point, forecastHour);
+                L.popup().setLatLng(event.latlng).setContent(`<strong>${{safe(result.level)}}</strong><br>${{safe(result.value)}}<br>${{safe(result.detail)}}<br>${{safe(forecastTimes[forecastHour] || '')}} UTC<br>Model grid point: ${{point.latitude.toFixed(2)}}, ${{point.longitude.toFixed(2)}}`).openOn(map);
+            }});
+            function selectHazard(name) {{
+                activeHazard = name;
+                document.querySelector('.map-legend').style.display = name === 'clouds' ? 'block' : 'none';
+                document.querySelectorAll('.hazard-menu button').forEach(button => button.classList.toggle('active', button.dataset.mode === name));
+                if (name === 'quakes') {{
+                    if (map.hasLayer(radarLayer)) map.removeLayer(radarLayer);
+                    if (map.hasLayer(forecastLayer)) map.removeLayer(forecastLayer);
+                    if (!map.hasLayer(earthquakeLayer)) earthquakeLayer.addTo(map);
+                }} else {{
+                    if (map.hasLayer(earthquakeLayer)) map.removeLayer(earthquakeLayer);
+                    if (name === 'radar') {{
+                        if (map.hasLayer(forecastLayer)) map.removeLayer(forecastLayer);
+                        if (!map.hasLayer(radarLayer)) radarLayer.addTo(map);
+                    }} else {{
+                        if (map.hasLayer(radarLayer)) map.removeLayer(radarLayer);
+                        if (!map.hasLayer(forecastLayer)) forecastLayer.addTo(map);
+                    }}
+                }}
+                updateTime();
+            }}
+            const menu = L.control({{ position: 'topleft' }});
+            menu.onAdd = () => {{
+                const div = L.DomUtil.create('div', 'hazard-menu');
+                [['clouds','Cloud cover'],['radar','Rain radar'],['rain','Rain / flood'],['wind','Wind gusts'],['heat','Heat stress'],['cold','Cold / snow'],['storm','Thunderstorm'],['quakes','Earthquakes']].forEach(([mode,label]) => {{
+                    const button = L.DomUtil.create('button', '', div);
+                    button.type = 'button'; button.dataset.mode = mode; button.textContent = label;
+                    button.classList.toggle('active', mode === activeHazard);
+                    button.onclick = () => selectHazard(mode);
+                }});
+                L.DomEvent.disableClickPropagation(div);
+                return div;
+            }};
+            menu.addTo(map);
+            const dock = L.control({{ position: 'bottomleft' }});
+            dock.onAdd = () => {{
+                const div = L.DomUtil.create('div', 'time-dock');
+                div.innerHTML = '<div class="time-row"><strong id="map-title">Rain radar</strong><span style="flex:1"></span><span id="time-range">Past radar / nowcast</span></div><div class="time-row"><span id="time-label" class="time-label">--:--</span><input id="time-slider" type="range" min="0" max="0" value="0"><button id="play-button" type="button" title="Play timeline">Play</button></div>';
+                L.DomEvent.disableClickPropagation(div);
+                return div;
+            }};
+            dock.addTo(map);
+            setTimeout(() => {{
+                const slider = document.getElementById('time-slider');
+                slider.oninput = () => {{ if (activeHazard === 'radar') radarIndex = Number(slider.value); else forecastHour = Number(slider.value); updateTime(); }};
+                document.getElementById('play-button').onclick = event => {{
+                    if (timer) {{ clearInterval(timer); timer = null; event.target.textContent = 'Play'; return; }}
+                    event.target.textContent = 'Pause';
+                    timer = setInterval(() => {{
+                        const max = activeHazard === 'radar' ? radarFrames.length - 1 : forecastTimes.length - 1;
+                        if (max < 1) {{ clearInterval(timer); timer = null; event.target.textContent = 'Play'; return; }}
+                        if (activeHazard === 'radar') radarIndex = (radarIndex + 1) % (max + 1); else forecastHour = (forecastHour + 1) % (max + 1);
+                        updateTime();
+                    }}, activeHazard === 'radar' ? 650 : 900);
+                }};
+                updateTime();
+            }}, 0);
+            L.control.scale({{ imperial: false }}).addTo(map);
+            const cloudLegend = L.control({{ position: 'bottomright' }});
+            cloudLegend.onAdd = () => {{
+                const div = L.DomUtil.create('div', 'map-legend');
+                div.innerHTML = '<strong>Cloud cover forecast</strong><div class="cloud-gradient"></div><div class="cloud-range"><span>Clear</span><span>Overcast</span></div><small>Model outlook</small>';
+                return div;
+            }};
+            cloudLegend.addTo(map);
+            document.querySelector('.map-legend').style.display = activeHazard === 'clouds' ? 'block' : 'none';
+        </script>
+    </body></html>
+    """
+    st.components.v1.html(map_html, height=650, scrolling=False)
+
+
 @st.cache_data(ttl=300)
 def fetch_disaster_feed(limit=8):
     url = f"https://eonet.gsfc.nasa.gov/api/v3/events?status=open&limit={limit}"
@@ -270,9 +614,16 @@ def load_historical_context(csv_path=None):
 
 
 def main():
-    st.set_page_config(page_title="MountainWatch AI", page_icon="⛰️", layout="wide")
-    st.title("⛰️ MountainWatch AI")
-    st.caption("Live disaster awareness for landslides, earthquakes, and extreme rainfall.")
+    st.set_page_config(page_title="MountainWatch AI", page_icon="⛰️", layout="wide", initial_sidebar_state="collapsed")
+    st.markdown(
+        """
+        <style>
+        [data-testid="stMainBlockContainer"] { padding-top: 0.7rem; }
+        [data-testid="stElementContainer"]:has(.mw-map-header) { margin-bottom: 0.25rem; }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
 
     st.sidebar.header("Monitoring settings")
     use_live_data = st.sidebar.toggle("Use live weather data", value=True)
@@ -310,6 +661,7 @@ def main():
         data_source = "Manual input"
 
     slope = st.sidebar.slider("Slope angle (degrees)", 0, 70, 35)
+    refresh_map = st.sidebar.button("Refresh map data", icon="🔄")
 
     contrib = build_contribution_breakdown(rain_24h, rain_3d, slope, soil)
     score = calculate_risk_score(rain_24h, rain_3d, slope, soil)
@@ -318,6 +670,32 @@ def main():
     severe_quakes = int((eq_df["mag"] >= 4.5).sum()) if not eq_df.empty else 0
     alert_level = determine_alert_level(score, severe_quakes, rain_24h)
     recommendations = get_recommendations(alert_level)
+
+    st.markdown(
+        '<div class="mw-map-header" style="display:flex;align-items:baseline;gap:12px;min-height:38px;">'
+        '<strong style="font-size:24px;color:#075879;">MountainWatch</strong>'
+        '<span style="font-size:11px;font-weight:700;color:#52717b;letter-spacing:1px;">LIVE HAZARD MAP</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
+    if refresh_map:
+        fetch_recent_earthquakes.clear()
+        fetch_hazard_outlook.clear()
+        fetch_radar_frames.clear()
+        st.rerun()
+
+    hazard_outlook = fetch_hazard_outlook(lat, lon, radius_km)
+    radar_frames = fetch_radar_frames()
+    if not hazard_outlook["available"]:
+        st.warning("Regional weather forecast is unavailable. Radar and earthquake layers may still be available.")
+    if not radar_frames:
+        st.info("Live radar frames are currently unavailable from the radar provider; forecast overlays remain available.")
+    render_hazard_map(lat, lon, radius_km, eq_df, hazard_outlook, radar_frames)
+    st.caption(
+        "Cloud cover and colored hazard fields are interpolated forecasts; Rain radar is observed/nowcast data. "
+        "The cloud layer is not a satellite image. "
+        "These layers are not official warnings and may miss local mountain conditions."
+    )
 
     if enable_whatsapp and whatsapp_number:
         whatsapp_link = build_whatsapp_link(whatsapp_number, whatsapp_template)
@@ -387,8 +765,7 @@ def main():
             st.caption("No live disaster feed data available right now.")
 
     with tab2:
-        st.write("Natural hazards tracked in this prototype: landslides, earthquakes, heavy rainfall, and flood risk indicators.")
-        st.map(eq_df[["latitude", "longitude"]] if not eq_df.empty else pd.DataFrame(columns=["latitude", "longitude"]))
+        st.info("The interactive weather map is displayed above.")
 
     with tab3:
         factor_df = pd.DataFrame({"Factor": list(contrib), "Points": list(contrib.values())}).set_index("Factor")
